@@ -1,0 +1,247 @@
+#!/bin/bash
+git-gloss() { cat <<EOF
+Usage: git-gloss [sha...]
+
+...where [sha...] is a list of zero or more commit hashes separated by spaces.
+If zero commit hashes are given, it add notes for all commits in the history.
+EOF
+}
+[[ $1 == "--help" || $1 == "-h" ]] && echo && git-gloss && exit 0
+[[ $1 == -* ]] && echo "Unrecognized option: $1" && exit 1
+
+GIT=${GIT:-git}
+GREP=${GREP:-grep}
+
+attention() {
+  echo " ⚠️  Attention: $*"
+}
+
+gh_api() {
+  response=$(gh api "$1" 2>/dev/null)
+  if [[ $(echo "$response" | jq ".status" 2>/dev/null) == '"403"' ]]; then
+    response=$(gh api "/rate_limit")
+    reset_time=$(echo "$response" | jq ".rate.reset")
+    current_time=$(date +%s)
+    seconds_to_sleep=$((reset_time - current_time + 1))
+    >&2 echo -n "⚠️  Attention: Hit the GitHub API rate limit. "
+    >&2 echo -n "Sleeping for $seconds_to_sleep seconds. "
+    sleep "$seconds_to_sleep"
+    response=$(gh api "$1" 2>/dev/null)
+  fi
+  echo "$response"
+}
+
+remote_url_property=remote.origin.url
+if [ -n "$($GIT config --get remote.upstream.url)" ]; then
+  remote_url_property=remote.upstream.url
+fi
+
+repo_url=$($GIT config --get $remote_url_property | sed -r \
+  's/.*(\@|\/\/)(.*)(\:|\/)([^:\/]*)\/([^\/]*)\.git/https:\/\/\2\/\4\/\5/')
+
+start_repo=$(echo "$repo_url" | rev | cut -d '/' -f-1 | rev)
+start_owner=$(echo "$repo_url" | rev | cut -d '/' -f2 | rev)
+if [[ $repo_url == *"github"* && -z "$start_repo" ]]; then
+  echo
+  echo -n -e "error: This tool must be run from within a clone " >&2
+  echo -e "of a GitHub repo. Stopping." >&2
+  exit 1;
+fi
+
+# shellcheck disable=SC2153
+other_repo=$(echo "$OTHER_REPO" | rev | cut -d '/' -f-1 | rev)
+other_owner=$(echo "$OTHER_REPO" | rev | cut -d '/' -f2 | rev)
+
+if ! [[ -x "$(command -v gh)" ]]; then
+  echo
+  echo -ne "error: You need the GitHub CLI <https://cli.github.com/>" >&2
+  echo "installed in order to use this tool. Stopping." >&2
+  exit 1;
+fi
+if ! [[ -x "$(command -v jq)" ]]; then
+  echo
+  echo -ne "error: You need jq <https://jqlang.github.io/jq/> " >&2
+  echo "installed in order to use this tool. Stopping." >&2
+  exit 1;
+fi
+all_commits=$(mktemp)
+commits_with_notes=$(mktemp)
+commits_without_notes=$(mktemp)
+$GIT log --pretty=format:"%H" > "$all_commits"
+$GIT notes list | xargs | tr " " "\n" > "$commits_with_notes"
+if [[ -s "$commits_with_notes" ]]; then
+  $GREP -Fxv -f "$commits_with_notes" "$all_commits" \
+    > "$commits_without_notes"
+else
+  commits_without_notes=$all_commits
+fi
+total_commits_count=$(wc -l < "$commits_without_notes" | xargs)
+if [ "$total_commits_count" -eq "0" ]; then
+  commits_without_notes=$all_commits
+fi
+current_commit_number=0
+
+add_note() {
+  ((current_commit_number++))
+  printf "%${#total_commits_count}d" "$current_commit_number"
+  echo -n "/$total_commits_count "
+  short_commit_hash=$(git rev-parse --short "$1")
+  echo -n "$short_commit_hash "
+  commit=$(gh_api "/repos/$owner/$repo/commits/$1")
+  if [[ $(echo "$commit" | jq ".status" 2>/dev/null) == '"422"' ]]; then
+    echo -n "https://github.com/$owner/$repo/commit/$short_commit_hash"
+    attention "Failed to fetch commit from GitHub; re-trying"
+    add_note "$1"
+  fi
+  pull_request=$(gh_api "/repos/$owner/$repo/commits/$1/pulls" 2>/dev/null)
+  if [[ "$pull_request" == "[]"
+      || $(echo "$pull_request" \
+        | jq ".status" 2>/dev/null) == '"422"' ]]; then
+    if [[ -n "$other_repo" ]]; then
+      other_commit=$(gh_api \
+        "/repos/$other_owner/$other_repo/commits/$1" 2>/dev/null)
+      if [[ $(echo "$other_commit" \
+          | jq ".status" 2>/dev/null) != '"422"' ]]; then
+        pull_request=$(gh_api \
+          "/repos/$other_owner/$other_repo/commits/$1/pulls" 2>/dev/null)
+        owner="$other_owner"; repo="$other_repo"
+      fi
+    fi
+  fi
+  echo -n "https://github.com/$owner/$repo/commit/$short_commit_hash"
+  committer=$(echo "$commit" | jq ".committer.login")
+  committer=$(echo "$committer" | tr -d '"')
+  # .author.login for commits is sometimes null; so, first get it from PR
+  author=$(echo "$pull_request" | jq ".[0].user.login")
+  if [[ "$author" == "null" ]]; then
+    author=$(echo "$commit" | jq ".author.login")
+  fi
+  author=$(echo "$author" | tr -d '"')
+  author_email=$(echo "$commit" | jq ".commit.author.email")
+  author_email=$(echo "$author_email" | tr -d '"')
+  author_first_commit=$(git log \
+    --format="%H" --no-use-mailmap --author="$author_email" | tail -1)
+  if [[ "$author" != "null" ]]; then
+    if [[ "$author_first_commit" == "$1" ]]; then
+      $GIT notes append --no-separator \
+        -m "Author: https://github.com/$author 🔰" "$1"
+    else
+      $GIT notes append --no-separator \
+        -m "Author: https://github.com/$author" "$1"
+    fi
+  elif [[ "$committer" != "null" ]]; then
+    # Some GitHub commits actually have neither a GitHub profile link for
+    # the commit author, nor a GitHub profile link for the committer;
+    # example: https://github.com/SerenityOS/serenity/commit/800242ed4e4
+    $GIT notes append --no-separator \
+      -m "Committer: https://github.com/$committer" "$1"
+  fi
+  $GIT notes append --no-separator -m \
+    "Commit: https://github.com/$owner/$repo/commit/$short_commit_hash" "$1"
+  if [[ "$pull_request" == "[]"
+      || $(echo "$pull_request" \
+        | jq ".status" 2>/dev/null) == '"422"' ]]; then
+    echo " ✅"
+    return 0
+  fi
+  pr_number=$(echo "$pull_request" | jq '.[0].number' 2>/dev/null)
+  if [[ -n "$pr_number" && "$pr_number" != "null" ]]; then
+    $GIT notes append --no-separator -m \
+      "Pull-request: https://github.com/$owner/$repo/pull/$pr_number" "$1"
+    # shellcheck disable=SC2016
+    query='query ($owner: String!, $repo: String!, $pr: Int!) {
+            repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $pr) {
+                            closingIssuesReferences(first: 100) {
+                                    nodes {
+                                            number
+                                    }
+                            }
+                    }
+            }
+    }'
+    issues_response=$(gh_api graphql \
+      -F owner="$owner" -F repo="$repo" -F pr="$pr_number" \
+      -f query="$query")
+    return_code=$?
+    if [[ "$return_code" -ne 0 ]]; then
+       attention "Failed to fetch issues from GitHub; re-trying"
+       $GIT notes remove "$short_commit_hash" 2>/dev/null
+       add_note "$short_commit_hash"
+    fi
+    issues=$(echo "$issues_response" | jq \
+      '.data.repository.pullRequest.closingIssuesReferences.nodes[].number' \
+      2>/dev/null
+    )
+    if [[ -n "$issues" ]]; then
+      for issue in $issues; do
+        $GIT notes append --no-separator \
+          -m "Issue: https://github.com/$owner/$repo/issues/$issue" "$1"
+      done;
+    fi
+    reviewer_data_file=$(mktemp)
+    reviews=$(gh_api \
+      "/repos/$owner/$repo/pulls/$pr_number/reviews")
+    if [[ $(echo "$reviews" | jq ".status" 2>/dev/null) == '"404"' ]]; then
+      attention "Failed to fetch reviews from GitHub; re-trying"
+      $GIT notes remove "$1" 2>/dev/null
+      add_note "$1"
+    fi
+    reviews=$(echo "$reviews" | jq "sort_by(.state)")
+    if [[ -n "$reviews" ]]; then
+      echo "$reviews" | jq -c -r '.[]' | while read -r review; do
+      reviewer=$(echo "$review" | jq -r ".user.login")
+        state=$(echo "$review" | jq -r ".state")
+        association=$(echo "$review" | jq -r ".author_association")
+        case "$association" in
+          OWNER | MEMBER | COLLABORATOR | OUTSIDE_COLLABORATOR | CONTRIBUTOR)
+            if [[ -z $($GREP "$reviewer" "$reviewer_data_file") \
+                && "$reviewer" != "$author"
+                && "github-actions[bot]" != "$reviewer" ]]; then
+              if [[ "$state" == "APPROVED" ]]; then
+                echo "Reviewed-by: https://github.com/$reviewer ✅" \
+                  >> "$reviewer_data_file";
+              else
+                echo "Reviewed-by: https://github.com/$reviewer" >> \
+                  "$reviewer_data_file";
+              fi
+            fi
+        esac
+      done
+      reviewer_data=$(sort "$reviewer_data_file" | uniq)
+      echo "$reviewer_data" > "$reviewer_data_file"
+      [[ -s "$reviewer_data_file" ]] && while read -r line; do
+        [[ -n "$line" ]] && $GIT notes append --no-separator -m "$line" "$1"
+      done < "$reviewer_data_file"
+    fi
+  fi
+  echo " ✅"
+}
+if [[ $total_commits_count == "0" ]]; then
+  echo "Found no commits to process. Stopping."
+  exit 0
+fi
+if [[ -z "$*" ]]; then
+  s="s" && [[ $total_commits_count == "1" ]] && s=""
+  echo "Found $total_commits_count commit$s to process."
+  echo
+  while read -r sha; do
+    owner=$start_owner
+    repo=$start_repo
+    if [[ -z $($GIT notes show "$sha" 2>/dev/null) ]]; then
+      add_note "$sha"
+    fi
+  done < "$commits_without_notes"
+else
+  total_commits_count=$#
+  s="s" && [[ $total_commits_count == "1" ]] && s=""
+  echo "Found $total_commits_count commit$s to process."
+  echo
+  for sha in "$@"; do
+    owner=$start_owner
+    repo=$start_repo
+    if [[ -z $($GIT notes show "$sha" 2>/dev/null) ]]; then
+      add_note "$sha"
+    fi
+  done
+fi
