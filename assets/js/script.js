@@ -9,7 +9,8 @@ const replaceOnDocument = (pattern, string, {target = document.body} = {}) => {
 };
 replaceOnDocument(/\[!IMPORTANT\]/g, "👋 Important: ");
 replaceOnDocument(/\[!NOTE\]/g, "👉 Note: ");
-replaceOnDocument(/https:\/\/github.com\/meiji163\/gh-notify\/assets\/92653266\/b7d7fcdb-8a25-43fc-8f63-d11f30960084/g,"")
+replaceOnDocument(/\[!TIP\]/g, "💡 Note: ");
+replaceOnDocument(/\[!CAUTION\]/g, "⚠️  Note: ");
 
 anchors.options.placement = 'left';
 document.addEventListener('DOMContentLoaded', function(event) { anchors.add(); });
